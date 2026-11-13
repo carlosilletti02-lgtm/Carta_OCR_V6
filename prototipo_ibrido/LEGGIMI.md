@@ -1,5 +1,15 @@
 # Ibrido: DeepSeek-OCR 2 + verifica contro il PDF + traduzione Qwen (PROTOTIPO, 13 nov 2026)
 
+## Scelta nella finestra di Carta OCR V6
+
+Nel menu **Modello di lettura** si puo' scegliere: V6 attuale, DeepSeek-OCR 2,
+MiniCPM-OCR 1.0 oppure Automatico (DeepSeek e recupero MiniCPM solo sulle pagine segnalate).
+Tutti i percorsi producono un PDF italiano. I tre percorsi OCR conservano anche Markdown tedesco e italiano.
+Il PDF OCR e' una copia da leggere, con una pagina per ogni pagina originale; non ricostruisce l'impaginazione del libro.
+Formule OCR LaTeX malformate sono segnalate in `AVVISI_PDF.txt` e mostrate come testo da verificare.
+La traduzione resta affidata a Qwen. Per MiniCPM e Automatico, la finestra avvia Ollama da sola se necessario,
+con `OLLAMA_NO_CLOUD=1` e ascolto limitato a `127.0.0.1`. Il modello deve gia' essere scaricato sul Mac.
+
 Obiettivo: da un PDF con testo digitale ottenere un **Markdown italiano con formule in LaTeX** piu' fedele di quello che darebbe
 DeepSeek da solo. Le formule non passano mai da Qwen. **V6 (il motore) non e' stato toccato.**
 Tre processi in sequenza, mai due modelli insieme: DeepSeek (fase 1) -> nessun modello (fase 2) -> Qwen (fase 3).
@@ -67,6 +77,26 @@ Lo stesso falso allarme colpisce V6: portare la correzione nel motore e' una mod
 - Testato solo su tedesco, 5 libri, nessuna tabella (i blocchi HTML sono lasciati in tedesco e segnalati), nessuna scansione, nessun inglese.
 - Il LaTeX non e' stato compilato (niente renderer offline): controllati solo parentesi, \begin/\end e comandi noti.
 - Se il PDF ha un refuso ("Spannnungs..."), l'ibrido lo riproduce. Non c'e' ancora la riscrittura in PDF: l'uscita e' Markdown.
+
+## Percorso di recupero MiniCPM (separato)
+
+`avvia_ibrido.py` esegue il percorso principale come prima. Dopo la fase 2, legge `rapporto.json`: se una pagina ha
+equazioni scartate, formule in linea sospette, differenze con il PDF o parole mancanti, `recupero_minicpm.py` la rilegge
+con MiniCPM-OCR 1.0 tramite un server **Ollama locale**. Le altre pagine non vengono rilette. Il risultato alternativo
+si trova in `uscita/<data>/recupero_minicpm/`, con un suo rapporto e una sua cache di traduzione. Il percorso principale
+non legge mai i file del recupero; se MiniCPM non e' disponibile, rimane utilizzabile.
+
+Serve Ollama con il modello `openbmb/minicpm-ocr1.0` scaricato e il servizio locale attivo. Ollama e' il programma che
+esegue il modello sul Mac; non occorre aggiungere librerie Python al runtime di CartaOCR. `--senza-recupero` disattiva
+il secondo percorso. Il recupero usa l'API locale `http://127.0.0.1:11434/api/generate`.
+Se usi gli script dal Terminale senza la finestra, avvia il servizio manualmente in modalita' solo locale con
+`OLLAMA_NO_CLOUD=1 ollama serve` e lascia aperto il terminale durante il lavoro. `OLLAMA_NO_CLOUD=1` disattiva le funzioni cloud di Ollama. Il modello
+si scarica una sola volta con `ollama pull openbmb/minicpm-ocr1.0` (serve Internet solo durante il download).
+
+**Il secondo risultato e' una proposta da verificare**, soprattutto sulle formule: MiniCPM legge la pagina intera e non
+fornisce i riquadri che la fase 2 usa per confrontare ogni formula con il PDF. I due Markdown sono quindi conservati
+separatamente. Il modello dichiara inglese e cinese come lingue principali; per i libri tedeschi va confrontato sulle
+stesse pagine difficili prima di sceglierlo come risultato definitivo.
 
 ## File
 `fase1_ocr_deepseek.py`, `fase2_assembla.py`, `fase3_traduci.py`, `avvia_ibrido.py`, `banco_di_prova.py`, `lingua_ibrido_deu.json`,

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Piccola finestra per la Carta OCR V6: scegli il libro, scegli prima e ultima pagina, premi Traduci.
+"""Finestra di Carta OCR V6: libro, pagine e percorso di lettura prima di tradurre.
 
-Tutto in locale: usa solo Tkinter (gia' nel Python di Carta OCR) e pymupdf (gia' installato). Non apre porte di rete,
-non carica il libro da nessuna parte: legge il PDF dal suo posto e lancia 'avvia_v6.py', che blocca la rete a livello
-di sistema (sandbox-exec) per tutta la traduzione. Il PDF originale non viene mai modificato.
+Tutto in locale: V6 e DeepSeek bloccano la rete; MiniCPM usa soltanto l'API Ollama sul Mac.
+Il PDF originale non viene mai modificato. Tutti i percorsi creano un PDF italiano;
+quelli OCR conservano anche il Markdown.
 
 Avvio (dal Terminale):
   PY="$HOME/Library/Application Support/CartaOCR/runtime/bin/python3"
@@ -19,12 +19,14 @@ import json
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
+import urllib.request
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -32,6 +34,14 @@ import pymupdf
 
 HERE = Path(__file__).resolve().parent
 LAUNCHER = HERE / 'avvia_v6.py'
+HYBRID = HERE / 'prototipo_ibrido' / 'avvia_ibrido.py'
+MINICPM = HERE / 'prototipo_ibrido' / 'avvia_minicpm.py'
+OCR_MODES = (
+    ('v6', 'V6 attuale → PDF tradotto'),
+    ('automatico', 'Automatico: DeepSeek, poi MiniCPM se serve → PDF + Markdown'),
+    ('deepseek', 'DeepSeek-OCR 2 → PDF + Markdown'),
+    ('minicpm', 'MiniCPM-OCR 1.0 → PDF + Markdown'),
+)
 PREVIEW_W = 200                       # larghezza delle anteprime in pixel
 RE_PAGE = re.compile(r'Pagina PDF (\d+)/(\d+)')
 RE_DIR = re.compile(r'^Risultati in:\s*(.+?)\s*$')
@@ -57,6 +67,21 @@ def fmt_time(seconds: float) -> str:
     return f'{h}:{m:02d}:{s:02d}' if h else f'{m:02d}:{s:02d}'
 
 
+def command_for_mode(mode: str, pdf: Path, language: str, first: int, last: int, fake: bool = False) -> list[str]:
+    """Tiene in un solo posto la scelta del percorso eseguito dalla finestra."""
+    if mode == 'v6':
+        command = [sys.executable, '-B', str(LAUNCHER), '--pdf', str(pdf), '--lingua', language,
+                   '--da', str(first), '--a', str(last)]
+        return command + (['--fake'] if fake else [])
+    if mode == 'minicpm':
+        return [sys.executable, '-B', str(MINICPM), '--pdf', str(pdf), '--lingua', language,
+                '--da', str(first), '--a', str(last)]
+    if mode in ('automatico', 'deepseek'):
+        command = [sys.executable, '-B', str(HYBRID), f'{pdf}:{first}-{last}', '--lingua', language]
+        return command + (['--senza-recupero'] if mode == 'deepseek' else [])
+    raise ValueError(f'Modalita\' OCR sconosciuta: {mode}')
+
+
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -67,6 +92,7 @@ class App(tk.Tk):
         self.total = 0
         self.toc: list[tuple[int, str, int, int]] = []        # (livello, titolo, pagina inizio, pagina fine)
         self.proc: subprocess.Popen | None = None
+        self.ollama_proc: subprocess.Popen | None = None
         self.q: queue.Queue = queue.Queue()
         self.out_dir: Path | None = None
         self.t0 = 0.0
@@ -80,6 +106,8 @@ class App(tk.Tk):
         self.var_to = tk.StringVar(value='10')
         self.var_fake = tk.BooleanVar(value=False)
         self.var_lang = tk.StringVar(value=self.langs[0][1])
+        self.var_ocr = tk.StringVar(value=OCR_MODES[0][1])
+        self.var_ocr_info = tk.StringVar(value='V6 usa il motore attuale e crea un PDF tradotto.')
         self.var_file = tk.StringVar(value='Nessun libro scelto')
         self.var_status = tk.StringVar(value='Scegli un PDF per cominciare.')
         self.var_time = tk.StringVar(value='')
@@ -123,8 +151,14 @@ class App(tk.Tk):
         ttk.Label(opt, text='Lingua del libro:').grid(row=0, column=0, sticky='w')
         self.cb_lang = ttk.Combobox(opt, state='readonly', width=26, values=[l[1] for l in self.langs], textvariable=self.var_lang)
         self.cb_lang.grid(row=0, column=1, sticky='w', padx=8)
-        ttk.Checkbutton(opt, text='Prova veloce: solo impaginazione, senza tradurre', variable=self.var_fake
-                        ).grid(row=1, column=0, columnspan=2, sticky='w', pady=(6, 0))
+        ttk.Label(opt, text='Modello di lettura:').grid(row=1, column=0, sticky='w', pady=(6, 0))
+        self.cb_ocr = ttk.Combobox(opt, state='readonly', width=56, values=[label for _, label in OCR_MODES],
+                                   textvariable=self.var_ocr)
+        self.cb_ocr.grid(row=1, column=1, sticky='w', padx=8, pady=(6, 0))
+        self.cb_ocr.bind('<<ComboboxSelected>>', self.on_ocr_change)
+        ttk.Label(opt, textvariable=self.var_ocr_info, wraplength=560).grid(row=2, column=0, columnspan=2, sticky='w', pady=(4, 0))
+        self.cb_fake = ttk.Checkbutton(opt, text='Prova veloce: solo impaginazione, senza tradurre', variable=self.var_fake)
+        self.cb_fake.grid(row=3, column=0, columnspan=2, sticky='w', pady=(6, 0))
 
         self.lbl_prev = {}
         for key, title in (('da', 'Prima pagina'), ('a', 'Ultima pagina')):
@@ -138,7 +172,7 @@ class App(tk.Tk):
         self.btn_stop = ttk.Button(run, text='Ferma', command=self.stop, state='disabled'); self.btn_stop.pack(side='left', padx=8)
         self.btn_dir = ttk.Button(run, text='Apri cartella risultati', command=lambda: self.open_path(self.out_dir), state='disabled')
         self.btn_pdf = ttk.Button(run, text='Apri PDF tradotto', command=lambda: self.open_path(self.result_pdf()), state='disabled')
-        self.btn_warn = ttk.Button(run, text='Apri AVVISI', command=lambda: self.open_path(self.out_dir / 'AVVISI.txt' if self.out_dir else None), state='disabled')
+        self.btn_warn = ttk.Button(run, text='Apri AVVISI', command=lambda: self.open_path(self.report_path()), state='disabled')
         for b in (self.btn_dir, self.btn_pdf, self.btn_warn):
             b.pack(side='left', padx=4)
 
@@ -263,6 +297,68 @@ class App(tk.Tk):
         found = sorted(self.out_dir.glob('*_italiano.pdf'))
         return found[0] if found else None
 
+    def ocr_mode(self) -> str:
+        return next(code for code, label in OCR_MODES if label == self.var_ocr.get())
+
+    def on_ocr_change(self, _event=None) -> None:
+        self.out_dir = None
+        for button in (self.btn_dir, self.btn_pdf, self.btn_warn):
+            button.configure(state='disabled')
+        mode = self.ocr_mode()
+        if mode == 'v6':
+            self.var_ocr_info.set('V6 usa il motore attuale e crea un PDF tradotto.')
+            self.cb_fake.configure(state='normal')
+            self.btn_warn.configure(text='Apri AVVISI')
+        else:
+            self.var_fake.set(False)
+            self.cb_fake.configure(state='disabled')
+            self.btn_warn.configure(text='Apri rapporto')
+            self.var_ocr_info.set('OCR e traduzione restano sul Mac. Crea PDF e Markdown; confronta le formule con l’originale.')
+
+    def report_path(self) -> Path | None:
+        if not self.out_dir:
+            return None
+        name = 'AVVISI.txt' if self.ocr_mode() == 'v6' else 'AVVISI_PDF.txt'
+        return self.out_dir / name
+
+    def local_ollama_models(self) -> list[str] | None:
+        """Legge i modelli dal servizio sul Mac; None significa servizio non raggiungibile."""
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open('http://127.0.0.1:11434/api/tags', timeout=2) as response:
+                return [m['name'] for m in json.load(response).get('models', [])]
+        except (OSError, ValueError, KeyError):
+            return None
+
+    def ensure_minicpm_ready(self) -> str | None:
+        """Avvia Ollama solo se necessario, sempre limitato al Mac e senza cloud."""
+        models = self.local_ollama_models()
+        if models is None:
+            executable = shutil.which('ollama') or '/opt/homebrew/bin/ollama'
+            if not Path(executable).is_file():
+                return 'Ollama non e\' installato sul Mac.'
+            self.var_status.set('Avvio Ollama in modalita\' solo locale…')
+            self.update_idletasks()
+            env = dict(os.environ, OLLAMA_NO_CLOUD='1', OLLAMA_HOST='127.0.0.1:11434')
+            try:
+                self.ollama_proc = subprocess.Popen([executable, 'serve'], env=env, stdin=subprocess.DEVNULL,
+                                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                                     start_new_session=True)
+            except OSError as exc:
+                return f'Non riesco ad avviare Ollama: {exc}'
+            for _ in range(30):
+                time.sleep(0.2)
+                models = self.local_ollama_models()
+                if models is not None:
+                    break
+                if self.ollama_proc.poll() is not None:
+                    return 'Ollama si e\' chiuso durante l\'avvio. Controlla il Terminale.'
+            if models is None:
+                return 'Ollama non risponde sul Mac. Prova ad avviarlo dal Terminale.'
+        if 'openbmb/minicpm-ocr1.0:latest' not in models:
+            return 'MiniCPM non e\' scaricato sul Mac. Esegui: ollama pull openbmb/minicpm-ocr1.0'
+        return None
+
     def start(self) -> None:
         if self.proc:
             return
@@ -276,12 +372,16 @@ class App(tk.Tk):
             return
         a, b = rng
         lang = next(c for c, label in self.langs if label == self.var_lang.get())
+        mode = self.ocr_mode()
+        if mode in ('automatico', 'minicpm'):
+            problem = self.ensure_minicpm_ready()
+            if problem:
+                messagebox.showerror('MiniCPM locale non pronto', problem)
+                return
         if not self.var_fake.get() and (b - a + 1) > 40:
             if not messagebox.askyesno('Molte pagine', f'Stai per tradurre {b - a + 1} pagine: ci vorra\' parecchio tempo. Continuare?'):
                 return
-        cmd = [sys.executable, '-B', str(LAUNCHER), '--pdf', str(self.pdf_path), '--lingua', lang, '--da', str(a), '--a', str(b)]
-        if self.var_fake.get():
-            cmd.append('--fake')
+        cmd = command_for_mode(mode, self.pdf_path, lang, a, b, self.var_fake.get())
         env = dict(os.environ, PYTHONUNBUFFERED='1')
         try:
             self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8',
@@ -293,11 +393,12 @@ class App(tk.Tk):
         self.run_first, self.run_last = a, b
         self.t0 = time.time()
         self.bar.configure(value=0)
-        self.var_status.set(f'Avvio… pagine {a}-{b} ({"solo impaginazione" if self.var_fake.get() else "traduzione"})')
+        self.var_status.set(f'Avvio {self.var_ocr.get()}… pagine {a}-{b}')
         self.clear_log()
         for btn in (self.btn_dir, self.btn_pdf, self.btn_warn):
             btn.configure(state='disabled')
         self.btn_go.configure(state='disabled'); self.btn_stop.configure(state='normal')
+        self.cb_ocr.configure(state='disabled')
         threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
 
     def _reader(self, proc: subprocess.Popen) -> None:
@@ -333,6 +434,7 @@ class App(tk.Tk):
     def on_end(self, code: int) -> None:
         self.proc = None
         self.btn_go.configure(state='normal'); self.btn_stop.configure(state='disabled')
+        self.cb_ocr.configure(state='readonly')
         elapsed = fmt_time(time.time() - self.t0)
         if self.out_dir and self.out_dir.is_dir():
             self.btn_dir.configure(state='normal')
@@ -340,10 +442,10 @@ class App(tk.Tk):
             self.var_status.set('Fermata: i risultati parziali, se ci sono, restano nella cartella.')
         elif code == 0:
             self.bar.configure(value=100)
-            self.var_status.set('FINITO. Guarda AVVISI.txt e confronta le pagine con l\'originale.')
+            self.var_status.set('FINITO. Apri il rapporto e confronta le formule con l\'originale.')
             if self.result_pdf():
                 self.btn_pdf.configure(state='normal')
-            if self.out_dir and (self.out_dir / 'AVVISI.txt').is_file():
+            if self.report_path() and self.report_path().is_file():
                 self.btn_warn.configure(state='normal')
         else:
             self.var_status.set(f'ERRORE (codice {code}): leggi il registro qui sotto.')
@@ -373,6 +475,8 @@ class App(tk.Tk):
             self.stop()
         if self.doc:
             self.doc.close()
+        if self.ollama_proc and self.ollama_proc.poll() is None:
+            self.ollama_proc.terminate()
         self.destroy()
 
     # ------------------------------------------------------------------ varie

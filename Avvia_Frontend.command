@@ -1,5 +1,5 @@
 #!/bin/bash
-# Doppio clic: apre la finestra di Carta OCR V6 (tutto in locale, nessuna rete).
+# Doppio clic: apre Carta OCR V6; MiniCPM usa solo Ollama sul Mac, senza rete esterna.
 cd "$(dirname "$0")" || exit 1
 PY="$HOME/Library/Application Support/CartaOCR/runtime/bin/python3"
 if [ ! -x "$PY" ]; then echo "Non trovo il Python di Carta OCR: $PY"; read -r -p "Premi invio per chiudere"; exit 1; fi
